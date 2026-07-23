@@ -52,7 +52,16 @@ function readDataFromExcelFile(file) {
   try {
     log('Reading Excel file directly without Drive conversion: ' + file.getName(), LOG_LEVEL.INFO);
 
-    const entries = Utilities.unzip(file.getBlob());
+    const fileName = String(file.getName() || '').toLowerCase();
+    if (!fileName.endsWith('.xlsx') && !fileName.endsWith('.xlsm')) {
+      log('Direct Excel read supports only .xlsx and .xlsm files; using Drive conversion fallback', LOG_LEVEL.INFO);
+      return [];
+    }
+
+    // XLSX/XLSM files are ZIP containers. Utilities.unzip requires the Blob
+    // content type to be application/zip even when Drive reports an Excel MIME.
+    const zipBlob = file.getBlob().copyBlob().setContentType('application/zip');
+    const entries = Utilities.unzip(zipBlob);
     const entryMap = {};
     entries.forEach((entry) => {
       entryMap[entry.getName()] = entry.getDataAsString('UTF-8');
