@@ -314,6 +314,7 @@ function getExistingOriginalAssigntoFromSheet(sheet, rowIndex, headerMap) {
  */
 function processAllRows(sheet, dataRows, headerMap) {
   try {
+    const processStartedAt = Date.now();
     let rowsToNotify = [];
     const maxCol = getMaxHeaderColumn(headerMap);
     const flowSheet = getFlowTrackingSheet(sheet.getParent());
@@ -326,6 +327,7 @@ function processAllRows(sheet, dataRows, headerMap) {
     const existingValues = lastRow > 0
       ? sheet.getRange(1, 1, lastRow, lastCol).getValues()
       : [];
+    logStep9Timing('Loaded target and tracking data', processStartedAt);
     const jobNoIndex = buildJobNoIndex(existingValues, headerMap);
     const updates = [];
     const appendRows = [];
@@ -355,6 +357,7 @@ function processAllRows(sheet, dataRows, headerMap) {
     });
 
     normalizedRows.sort(compareRowDataByContactDate);
+    const rowProcessingStartedAt = Date.now();
 
     normalizedRows.forEach((rowData) => {
         const jobNoKey = String(rowData.jobNo).trim();
@@ -415,14 +418,23 @@ function processAllRows(sheet, dataRows, headerMap) {
           }
         }
     });
+    logStep9Timing('Compared ' + normalizedRows.length + ' eligible rows', rowProcessingStartedAt);
 
     const shouldSort = shouldSortAfterBatch(existingValues, updates, appendRows, headerMap);
-    writeBatchUpdates(sheet, updates, maxCol);
+    const writeStartedAt = Date.now();
+    writeBatchUpdates(sheet, updates, maxCol, existingValues);
     appendBatchRows(sheet, lastRow, appendRows, maxCol);
     appendBatchRows(flowSheet, flowSheet.getLastRow(), flowRowsToAppend, flowMaxCol);
+    logStep9Timing(
+      'Wrote ' + updates.length + ' updates, ' + appendRows.length +
+      ' new rows and ' + flowRowsToAppend.length + ' tracking rows',
+      writeStartedAt
+    );
     if (shouldSort) {
+      const sortStartedAt = Date.now();
       sortSheetByContactDate(sheet, headerMap);
       rowsToNotify = refreshRowsToNotifyIndexes(sheet, rowsToNotify, headerMap);
+      logStep9Timing('Sorted target sheet and refreshed notification indexes', sortStartedAt);
     } else {
       log('Skipped full sheet sort because contactDate order is already valid', LOG_LEVEL.INFO);
     }
@@ -435,12 +447,18 @@ function processAllRows(sheet, dataRows, headerMap) {
     log('Rows skipped service type: ' + skippedServiceType, LOG_LEVEL.INFO);
     log('Rows skipped no change: ' + skippedNoChange, LOG_LEVEL.INFO);
     log('Rows to notify: ' + rowsToNotify.length, LOG_LEVEL.INFO);
+    logStep9Timing('Completed Step 9', processStartedAt);
     
     return rowsToNotify;
   } catch (e) {
     log('Error processing all rows: ' + e.message, LOG_LEVEL.ERROR);
     return [];
   }
+}
+
+function logStep9Timing(label, startedAt) {
+  const elapsedSeconds = (Date.now() - startedAt) / 1000;
+  log('Step 9 timing - ' + label + ': ' + elapsedSeconds.toFixed(2) + ' seconds', LOG_LEVEL.INFO);
 }
 
 function getMaxHeaderColumn(headerMap) {
@@ -564,30 +582,37 @@ function buildSheetRowValues(existingRow, updateData, maxCol) {
   return row;
 }
 
-function writeBatchUpdates(sheet, updates, maxCol) {
+function writeBatchUpdates(sheet, updates, maxCol, existingValues) {
   if (!updates.length) return;
 
   updates.sort((a, b) => a.rowIndex - b.rowIndex);
+  const firstRow = updates[0].rowIndex;
+  const lastRow = updates[updates.length - 1].rowIndex;
+  const rowCount = lastRow - firstRow + 1;
+  const updateByRow = {};
+  const existingFormulas = sheet.getRange(firstRow, 1, rowCount, maxCol).getFormulas();
 
-  let groupStart = updates[0].rowIndex;
-  let groupValues = [updates[0].values];
-  let previousRow = updates[0].rowIndex;
+  updates.forEach((item) => {
+    updateByRow[item.rowIndex] = item.values;
+  });
 
-  for (let i = 1; i < updates.length; i++) {
-    const item = updates[i];
-
-    if (item.rowIndex === previousRow + 1) {
-      groupValues.push(item.values);
-    } else {
-      sheet.getRange(groupStart, 1, groupValues.length, maxCol).setValues(groupValues);
-      groupStart = item.rowIndex;
-      groupValues = [item.values];
+  const values = [];
+  for (let rowIndex = firstRow; rowIndex <= lastRow; rowIndex++) {
+    if (updateByRow[rowIndex]) {
+      values.push(updateByRow[rowIndex]);
+      continue;
     }
 
-    previousRow = item.rowIndex;
+    const existingRow = (existingValues && existingValues[rowIndex - 1]) || [];
+    const formulaRow = existingFormulas[rowIndex - firstRow] || [];
+    const preservedRow = [];
+    for (let col = 0; col < maxCol; col++) {
+      preservedRow[col] = formulaRow[col] || (existingRow[col] !== undefined ? existingRow[col] : '');
+    }
+    values.push(preservedRow);
   }
 
-  sheet.getRange(groupStart, 1, groupValues.length, maxCol).setValues(groupValues);
+  sheet.getRange(firstRow, 1, values.length, maxCol).setValues(values);
 }
 
 function appendBatchRows(sheet, lastRow, appendRows, maxCol) {
@@ -677,7 +702,7 @@ function markUnsentEmailRowsAsSentTodayInSheet(sheet, markedAt) {
     marked++;
   }
 
-  writeBatchUpdates(sheet, updates, maxCol);
+  writeBatchUpdates(sheet, updates, maxCol, values);
   log('Marked unsent email rows in sheet ' + sheet.getName() + ': ' + marked, LOG_LEVEL.INFO);
 
   return {
