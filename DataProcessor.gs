@@ -1,0 +1,901 @@
+/**
+ * DataProcessor.gs - ประมวลผลข้อมูลและลงใน Google Sheet
+ * 
+ * ฟังก์ชันสำหรับ:
+ * - ประมวลผลข้อมูลแต่ละแถว
+ * - ตรวจสอบ jobNo ซ้ำ
+ * - อัปเดตข้อมูลเดิมหรือเพิ่มข้อมูลใหม่
+ */
+
+/**
+ * ประมวลผลข้อมูลแต่ละแถว - append หรือ update
+ * @param {Sheet} sheet - Sheet object
+ * @param {Object} rowData - ข้อมูลแถวที่จัดรูปแบบแล้ว
+ * @param {Object} headerMap - Header map
+ */
+function processRow(sheet, rowData, headerMap) {
+  try {
+    // ถ้าไม่มี jobNo ให้ข้ามแถวนี้
+    if (!rowData.jobNo) {
+      log('Skipping row with empty jobNo', LOG_LEVEL.WARNING);
+      return;
+    }
+    
+    // หาตำแหน่งแถวของ jobNo เดิม
+    const existingRowIndex = findRowByJobNo(sheet, rowData.jobNo, headerMap);
+    const flowSheet = getFlowTrackingSheet(sheet.getParent());
+    const flowHeaderMap = buildFlowTrackingHeaderMap(flowSheet);
+    const existingFlowEventKeys = buildFlowEventKeyIndex(flowSheet, flowHeaderMap);
+    const contactMap = getEmailContactMap();
+    
+    // สร้างข้อมูลสำหรับอัปเดต
+    const updateData = buildUpdateData(rowData, headerMap);
+    
+    if (existingRowIndex) {
+      // jobNo เดิม - ตรวจสอบว่าต้องอัปเดตหรือไม่
+      const existingStatus = String(getCellValue(sheet, existingRowIndex, headerMap.lastStatus) || '').trim();
+      const existingAssignto = String(getCellValue(sheet, existingRowIndex, headerMap.assignto) || '').trim();
+      const existingSysDevelop = String(headerMap.sysDevelop ? getCellValue(sheet, existingRowIndex, headerMap.sysDevelop) || '' : '').trim();
+      const existingOriginalAssignto = getExistingOriginalAssigntoFromSheet(sheet, existingRowIndex, headerMap);
+      const existingEmailKey = getLastEmailKeyFromSheet(sheet, existingRowIndex, headerMap);
+      const currentEmailKey = buildEmailNotificationKey(rowData);
+      applyOriginalAssigntoToUpdateData(updateData, headerMap, rowData, existingOriginalAssignto, existingAssignto);
+      
+      const hasStatusChanged = existingStatus !== String(rowData.status).trim();
+      const hasAssigntoChanged = existingAssignto !== String(rowData.assignto).trim();
+      const hasSysDevelopChanged = existingSysDevelop !== String(rowData.sysDevelop || '').trim();
+      const shouldNotify = shouldProcessForEmail(rowData.status, '') && existingEmailKey !== currentEmailKey;
+      const shouldBackfillOriginalAssignto = headerMap.originalAssignto && !existingOriginalAssignto && !!updateData[headerMap.originalAssignto];
+      const shouldAddFlowEvent = hasStatusChanged || hasAssigntoChanged || hasSysDevelopChanged;
+      if (shouldAddFlowEvent) {
+        appendFlowTrackingEventIfNeeded(flowSheet, flowHeaderMap, existingFlowEventKeys, rowData, 'update', contactMap);
+      }
+      
+      if (hasStatusChanged || hasAssigntoChanged || hasSysDevelopChanged || shouldBackfillOriginalAssignto) {
+        // มีการเปลี่ยนแปลง - ให้อัปเดต
+        setRowValues(sheet, existingRowIndex, updateData);
+        log('Updated existing row: ' + rowData.jobNo, LOG_LEVEL.INFO);
+        
+        // ทำเครื่องหมาย email ต้องส่งอีกครั้ง
+        if (hasStatusChanged || hasAssigntoChanged) {
+          setCellValue(sheet, existingRowIndex, headerMap.mailSent, '');
+        }
+        
+        // เพิ่มตัวอักษร email handler ให้ส่งอีเมล
+        return { rowIndex: existingRowIndex, isNew: false, shouldNotify: shouldNotify };
+      } else {
+        // ไม่มีการเปลี่ยนแปลง - ข้ามไป
+        log('No changes for jobNo: ' + rowData.jobNo, LOG_LEVEL.DEBUG);
+        return { rowIndex: existingRowIndex, isNew: false, shouldNotify: false };
+      }
+    } else {
+      // jobNo ใหม่ - ให้เพิ่มแถวใหม่
+      const newRowIndex = sheet.getLastRow() + 1;
+      applyOriginalAssigntoToUpdateData(updateData, headerMap, rowData, '', '');
+      appendFlowTrackingEventIfNeeded(flowSheet, flowHeaderMap, existingFlowEventKeys, rowData, 'create', contactMap);
+      setRowValues(sheet, newRowIndex, updateData);
+      log('Added new row: ' + rowData.jobNo, LOG_LEVEL.INFO);
+      
+      return { rowIndex: newRowIndex, isNew: true, shouldNotify: shouldProcessForEmail(rowData.status, '') };
+    }
+  } catch (e) {
+    log('Error processing row: ' + e.message, LOG_LEVEL.ERROR);
+    return null;
+  }
+}
+
+/**
+ * สร้างข้อมูลสำหรับอัปเดต (update data object)
+ * @param {Object} rowData - ข้อมูลแถวที่จัดรูปแบบแล้ว
+ * @param {Object} headerMap - Header map
+ * @return {Object} Object ที่มี colNumber: value
+ */
+function buildUpdateData(rowData, headerMap) {
+  try {
+    const update = {};
+    
+    // เก็บค่าของแต่ละฟิลด์ตามที่กำหนดใน header map
+    Object.keys(headerMap).forEach((key) => {
+      if (rowData[key] !== undefined && rowData[key] !== null) {
+        update[headerMap[key]] = rowData[key];
+      }
+    });
+    
+    // บันทึก status ปัจจุบันไปที่ lastStatus
+    if (headerMap.lastStatus && rowData.status) {
+      update[headerMap.lastStatus] = rowData.status;
+    }
+    
+    // บันทึกเวลา update
+    if (headerMap.updatedAt) {
+      update[headerMap.updatedAt] = formatThaiDate(new Date());
+    }
+    
+    return update;
+  } catch (e) {
+    log('Error building update data: ' + e.message, LOG_LEVEL.ERROR);
+    return {};
+  }
+}
+
+/**
+ * ใส่ค่า originalAssignto เฉพาะตอนสร้างงานใหม่ หรือเติมแถวเดิมที่ยังว่าง
+ * @param {Object} updateData - update data object
+ * @param {Object} headerMap - Header map
+ * @param {Object} rowData - ข้อมูลแถวใหม่
+ * @param {string} existingOriginalAssignto - originalAssignto เดิม
+ * @param {string} existingAssignto - assignto เดิมในชีท
+ */
+function applyOriginalAssigntoToUpdateData(updateData, headerMap, rowData, existingOriginalAssignto, existingAssignto) {
+  if (!headerMap.originalAssignto || existingOriginalAssignto) {
+    return;
+  }
+
+  if (!isOriginalAssigntoCaptureStatus(rowData && rowData.status)) {
+    return;
+  }
+
+  updateData[headerMap.originalAssignto] = String((rowData && rowData.assignto) || '').trim();
+}
+
+/**
+ * ตรวจสอบสถานะที่ควรบันทึก originalAssignto ครั้งแรก
+ * @param {*} status - สถานะงาน
+ * @return {boolean} true ถ้าเป็น Continue
+ */
+function isOriginalAssigntoCaptureStatus(status) {
+  return String(status || '').trim().toLowerCase() === 'continue';
+}
+
+/**
+ * สร้าง index eventKey ที่มีอยู่ในชีท FLOW_TRACKING
+ * @param {Sheet} flowSheet - FLOW_TRACKING sheet
+ * @param {Object} flowHeaderMap - Header map ของ FLOW_TRACKING
+ * @return {Object} map eventKey: true
+ */
+function buildFlowEventKeyIndex(flowSheet, flowHeaderMap) {
+  const index = {};
+
+  if (!flowSheet || !flowHeaderMap || !flowHeaderMap.eventKey || flowSheet.getLastRow() <= 1) {
+    return index;
+  }
+
+  const values = flowSheet
+    .getRange(2, flowHeaderMap.eventKey, flowSheet.getLastRow() - 1, 1)
+    .getValues();
+
+  values.forEach((row) => {
+    const eventKey = String(row[0] || '').trim();
+    if (eventKey) {
+      index[eventKey] = true;
+    }
+  });
+
+  return index;
+}
+
+/**
+ * สร้าง eventKey ของ flow เพื่อกันบันทึกซ้ำ
+ * @param {Object} rowData - ข้อมูลแถว
+ * @return {string} event key
+ */
+function buildFlowEventKey(rowData) {
+  const jobNo = String((rowData && rowData.jobNo) || '').trim();
+  const status = String((rowData && rowData.status) || '').trim().toLowerCase();
+  const assignto = String((rowData && rowData.assignto) || '').trim();
+  const sysDevelop = String((rowData && rowData.sysDevelop) || '').trim();
+
+  return [jobNo, status, assignto, sysDevelop].join('|');
+}
+
+/**
+ * ต่อ event ลง queue ถ้ายังไม่เคยบันทึก
+ * @param {Array<Array>} flowRowsToAppend - queue row ที่จะ append
+ * @param {Object} flowHeaderMap - Header map ของ FLOW_TRACKING
+ * @param {Object} existingFlowEventKeys - index eventKey ที่มีแล้ว
+ * @param {Object} rowData - ข้อมูลแถว
+ * @param {string} eventType - create/update
+ * @param {Object} contactMap - map ชื่อจาก EMAIL
+ */
+function queueFlowTrackingEventIfNeeded(flowRowsToAppend, flowHeaderMap, existingFlowEventKeys, rowData, eventType, contactMap) {
+  const eventKey = buildFlowEventKey(rowData);
+
+  if (!eventKey || existingFlowEventKeys[eventKey]) {
+    return;
+  }
+
+  flowRowsToAppend.push(buildFlowTrackingSheetRow(rowData, eventType, contactMap, flowHeaderMap));
+  existingFlowEventKeys[eventKey] = true;
+}
+
+/**
+ * Append event ลง FLOW_TRACKING ทันที สำหรับ processRow แบบเดี่ยว
+ * @param {Sheet} flowSheet - FLOW_TRACKING sheet
+ * @param {Object} flowHeaderMap - Header map ของ FLOW_TRACKING
+ * @param {Object} existingFlowEventKeys - index eventKey ที่มีแล้ว
+ * @param {Object} rowData - ข้อมูลแถว
+ * @param {string} eventType - create/update
+ * @param {Object} contactMap - map ชื่อจาก EMAIL
+ */
+function appendFlowTrackingEventIfNeeded(flowSheet, flowHeaderMap, existingFlowEventKeys, rowData, eventType, contactMap) {
+  const rows = [];
+  queueFlowTrackingEventIfNeeded(rows, flowHeaderMap, existingFlowEventKeys, rowData, eventType, contactMap);
+
+  if (rows.length > 0) {
+    appendBatchRows(flowSheet, flowSheet.getLastRow(), rows, getMaxHeaderColumn(flowHeaderMap));
+  }
+}
+
+/**
+ * สร้าง row สำหรับชีท FLOW_TRACKING
+ * @param {Object} rowData - ข้อมูลแถว
+ * @param {string} eventType - create/update
+ * @param {Object} contactMap - map ชื่อจาก EMAIL
+ * @param {Object} flowHeaderMap - Header map ของ FLOW_TRACKING
+ * @return {Array} row values
+ */
+function buildFlowTrackingSheetRow(rowData, eventType, contactMap, flowHeaderMap) {
+  const maxCol = getMaxHeaderColumn(flowHeaderMap);
+  const row = [];
+  const assignto = String((rowData && rowData.assignto) || '').trim();
+  const ownerSubjectId = String((rowData && rowData.ownerSubjectId) || '').trim();
+  const sysDevelop = String((rowData && rowData.sysDevelop) || '').trim();
+  const nowText = formatThaiDate(new Date());
+  const valuesByKey = {
+    timestamp: nowText,
+    jobNo: String((rowData && rowData.jobNo) || '').trim(),
+    status: String((rowData && rowData.status) || '').trim(),
+    assignto: assignto,
+    assigntoName: getContactNameFromMap(assignto, contactMap),
+    ownerSubjectId: ownerSubjectId,
+    ownerSubjectName: getContactNameFromMap(ownerSubjectId, contactMap),
+    sysDevelop: sysDevelop,
+    sysDevelopName: getContactNameFromMap(sysDevelop, contactMap),
+    eventType: eventType || '',
+    sourceUpdatedAt: nowText,
+    eventKey: buildFlowEventKey(rowData)
+  };
+
+  for (let i = 0; i < maxCol; i++) {
+    row[i] = '';
+  }
+
+  Object.keys(valuesByKey).forEach((key) => {
+    if (flowHeaderMap[key]) {
+      row[flowHeaderMap[key] - 1] = valuesByKey[key];
+    }
+  });
+
+  return row;
+}
+
+/**
+ * ดึงชื่อจาก contactMap
+ * @param {string} id - assignto id
+ * @param {Object} contactMap - map ชื่อจาก EMAIL
+ * @return {string} ชื่อ
+ */
+function getContactNameFromMap(id, contactMap) {
+  const normalizedId = String(id || '').trim();
+  const contact = contactMap && contactMap[normalizedId];
+
+  return contact ? String(contact.name || '').trim() : '';
+}
+
+/**
+ * อ่าน originalAssignto จาก row values
+ * @param {Array} row - ข้อมูลหนึ่งแถวจากชีท
+ * @param {Object} headerMap - Header map
+ * @return {string} originalAssignto
+ */
+function getExistingOriginalAssigntoFromRow(row, headerMap) {
+  if (!headerMap.originalAssignto) return '';
+  return String((row && row[headerMap.originalAssignto - 1]) || '').trim();
+}
+
+/**
+ * อ่าน originalAssignto จากชีท
+ * @param {Sheet} sheet - Sheet object
+ * @param {number} rowIndex - หมายเลขแถว
+ * @param {Object} headerMap - Header map
+ * @return {string} originalAssignto
+ */
+function getExistingOriginalAssigntoFromSheet(sheet, rowIndex, headerMap) {
+  if (!headerMap.originalAssignto) return '';
+  return String(getCellValue(sheet, rowIndex, headerMap.originalAssignto) || '').trim();
+}
+
+/**
+ * ประมวลผลข้อมูลทั้งหมดและลงลงใน Sheet
+ * @param {Sheet} sheet - Sheet object
+ * @param {Array} dataRows - Array ของข้อมูล
+ * @param {Object} headerMap - Header map
+ * @return {Array} Array ของ rows ที่ต้องส่ง email
+ */
+function processAllRows(sheet, dataRows, headerMap) {
+  try {
+    let rowsToNotify = [];
+    const maxCol = getMaxHeaderColumn(headerMap);
+    const flowSheet = getFlowTrackingSheet(sheet.getParent());
+    const flowHeaderMap = buildFlowTrackingHeaderMap(flowSheet);
+    const flowMaxCol = getMaxHeaderColumn(flowHeaderMap);
+    const existingFlowEventKeys = buildFlowEventKeyIndex(flowSheet, flowHeaderMap);
+    const contactMap = getEmailContactMap();
+    const lastRow = sheet.getLastRow();
+    const lastCol = Math.max(sheet.getLastColumn(), maxCol);
+    const existingValues = lastRow > 0
+      ? sheet.getRange(1, 1, lastRow, lastCol).getValues()
+      : [];
+    const jobNoIndex = buildJobNoIndex(existingValues, headerMap);
+    const updates = [];
+    const appendRows = [];
+    const flowRowsToAppend = [];
+    let skippedEmptyJobNo = 0;
+    let skippedServiceType = 0;
+    let skippedNoChange = 0;
+    const normalizedRows = [];
+    
+    dataRows.forEach((rawRow, index) => {
+      // จัดรูปแบบข้อมูล
+      const rowData = normalizeRow(rawRow);
+      
+      if (rowData) {
+        if (!rowData.jobNo) {
+          skippedEmptyJobNo++;
+          return;
+        }
+
+        if (!isAllowedServiceType(rowData.sysserViceTypeName)) {
+          skippedServiceType++;
+          return;
+        }
+
+        normalizedRows.push(rowData);
+      }
+    });
+
+    normalizedRows.sort(compareRowDataByContactDate);
+
+    normalizedRows.forEach((rowData) => {
+        const jobNoKey = String(rowData.jobNo).trim();
+        const existingRowIndex = jobNoIndex[jobNoKey];
+        const updateData = buildUpdateData(rowData, headerMap);
+
+        if (existingRowIndex) {
+          const existingRow = existingValues[existingRowIndex - 1] || [];
+          const existingStatus = String(existingRow[headerMap.lastStatus - 1] || '').trim();
+          const existingAssignto = String(existingRow[headerMap.assignto - 1] || '').trim();
+          const existingSysDevelop = String(headerMap.sysDevelop ? existingRow[headerMap.sysDevelop - 1] || '' : '').trim();
+          const existingOriginalAssignto = getExistingOriginalAssigntoFromRow(existingRow, headerMap);
+          const existingEmailKey = getLastEmailKeyFromRow(existingRow, headerMap);
+          const currentEmailKey = buildEmailNotificationKey(rowData);
+          applyOriginalAssigntoToUpdateData(updateData, headerMap, rowData, existingOriginalAssignto, existingAssignto);
+          const hasStatusChanged = existingStatus !== String(rowData.status).trim();
+          const hasAssigntoChanged = existingAssignto !== String(rowData.assignto).trim();
+          const hasSysDevelopChanged = existingSysDevelop !== String(rowData.sysDevelop || '').trim();
+          const shouldNotify = shouldProcessForEmail(rowData.status, '') && existingEmailKey !== currentEmailKey;
+          const shouldBackfillOriginalAssignto = headerMap.originalAssignto && !existingOriginalAssignto && !!updateData[headerMap.originalAssignto];
+          const shouldAddFlowEvent = hasStatusChanged || hasAssigntoChanged || hasSysDevelopChanged;
+          if (shouldAddFlowEvent) {
+            queueFlowTrackingEventIfNeeded(flowRowsToAppend, flowHeaderMap, existingFlowEventKeys, rowData, 'update', contactMap);
+          }
+
+          if (hasStatusChanged || hasAssigntoChanged || hasSysDevelopChanged || shouldBackfillOriginalAssignto) {
+            if (hasStatusChanged || hasAssigntoChanged) {
+              updateData[headerMap.mailSent] = '';
+            }
+            updates.push({
+              rowIndex: existingRowIndex,
+              values: buildSheetRowValues(existingRow, updateData, maxCol)
+            });
+
+            if (shouldNotify) {
+              rowsToNotify.push({
+                rowIndex: existingRowIndex,
+                rowData: rowData,
+                isNew: false
+              });
+            }
+          } else {
+            skippedNoChange++;
+          }
+        } else {
+          const newRowIndex = lastRow + appendRows.length + 1;
+          applyOriginalAssigntoToUpdateData(updateData, headerMap, rowData, '', '');
+          queueFlowTrackingEventIfNeeded(flowRowsToAppend, flowHeaderMap, existingFlowEventKeys, rowData, 'create', contactMap);
+          appendRows.push(buildSheetRowValues([], updateData, maxCol));
+          jobNoIndex[jobNoKey] = newRowIndex;
+
+          if (shouldProcessForEmail(rowData.status, '')) {
+            rowsToNotify.push({
+              rowIndex: newRowIndex,
+              rowData: rowData,
+              isNew: true
+            });
+          }
+        }
+    });
+
+    const shouldSort = shouldSortAfterBatch(existingValues, updates, appendRows, headerMap);
+    writeBatchUpdates(sheet, updates, maxCol);
+    appendBatchRows(sheet, lastRow, appendRows, maxCol);
+    appendBatchRows(flowSheet, flowSheet.getLastRow(), flowRowsToAppend, flowMaxCol);
+    if (shouldSort) {
+      sortSheetByContactDate(sheet, headerMap);
+      rowsToNotify = refreshRowsToNotifyIndexes(sheet, rowsToNotify, headerMap);
+    } else {
+      log('Skipped full sheet sort because contactDate order is already valid', LOG_LEVEL.INFO);
+    }
+    
+    log('Processed ' + dataRows.length + ' rows', LOG_LEVEL.INFO);
+    log('Rows updated: ' + updates.length, LOG_LEVEL.INFO);
+    log('Rows appended: ' + appendRows.length, LOG_LEVEL.INFO);
+    log('Flow tracking events appended: ' + flowRowsToAppend.length, LOG_LEVEL.INFO);
+    log('Rows skipped empty jobNo: ' + skippedEmptyJobNo, LOG_LEVEL.INFO);
+    log('Rows skipped service type: ' + skippedServiceType, LOG_LEVEL.INFO);
+    log('Rows skipped no change: ' + skippedNoChange, LOG_LEVEL.INFO);
+    log('Rows to notify: ' + rowsToNotify.length, LOG_LEVEL.INFO);
+    
+    return rowsToNotify;
+  } catch (e) {
+    log('Error processing all rows: ' + e.message, LOG_LEVEL.ERROR);
+    return [];
+  }
+}
+
+function getMaxHeaderColumn(headerMap) {
+  return Object.keys(headerMap).reduce((max, key) => {
+    return Math.max(max, headerMap[key]);
+  }, 0);
+}
+
+function buildJobNoIndex(values, headerMap) {
+  const index = {};
+  const jobNoCol = headerMap.jobNo - 1;
+
+  for (let r = 1; r < values.length; r++) {
+    const jobNo = String(values[r][jobNoCol] || '').trim();
+    if (jobNo && !index[jobNo]) {
+      index[jobNo] = r + 1;
+    }
+  }
+
+  return index;
+}
+
+function compareRowDataByContactDate(a, b) {
+  return compareDateValues(a.contactDate, b.contactDate);
+}
+
+function compareDateValues(a, b) {
+  const dateA = parseContactDateValue(a);
+  const dateB = parseContactDateValue(b);
+
+  if (!dateA && !dateB) return 0;
+  if (!dateA) return 1;
+  if (!dateB) return -1;
+
+  return dateA.getTime() - dateB.getTime();
+}
+
+function parseContactDateValue(value) {
+  if (!value) return null;
+  if (value instanceof Date) return value;
+
+  const text = String(value).trim();
+  const thaiFormat = /^(\d{1,2})\/(\d{1,2})\/(\d{4})(?:\s+(\d{1,2}):(\d{1,2})(?::(\d{1,2}))?)?$/;
+  const thaiMatch = thaiFormat.exec(text);
+
+  if (thaiMatch) {
+    return new Date(
+      parseInt(thaiMatch[3], 10),
+      parseInt(thaiMatch[2], 10) - 1,
+      parseInt(thaiMatch[1], 10),
+      parseInt(thaiMatch[4] || '0', 10),
+      parseInt(thaiMatch[5] || '0', 10),
+      parseInt(thaiMatch[6] || '0', 10)
+    );
+  }
+
+  return parseDate(value);
+}
+
+function shouldSortAfterBatch(existingValues, updates, appendRows, headerMap) {
+  if (!headerMap.contactDate) return false;
+
+  const values = existingValues.map((row) => row.slice());
+
+  updates.forEach((item) => {
+    values[item.rowIndex - 1] = item.values;
+  });
+
+  appendRows.forEach((row) => {
+    values.push(row);
+  });
+
+  return isContactDateOrderDirty(values, headerMap);
+}
+
+function isContactDateOrderDirty(values, headerMap) {
+  const contactDateCol = headerMap.contactDate - 1;
+  let previousDate = null;
+
+  for (let r = 1; r < values.length; r++) {
+    const currentDate = parseContactDateValue(values[r][contactDateCol]);
+    if (!currentDate) continue;
+
+    if (previousDate && previousDate.getTime() > currentDate.getTime()) {
+      return true;
+    }
+
+    previousDate = currentDate;
+  }
+
+  return false;
+}
+
+function refreshRowsToNotifyIndexes(sheet, rowsToNotify, headerMap) {
+  if (!rowsToNotify.length) return rowsToNotify;
+
+  const values = sheet.getDataRange().getValues();
+  const jobNoIndex = buildJobNoIndex(values, headerMap);
+
+  return rowsToNotify.map((item) => {
+    const jobNo = String(item.rowData.jobNo || '').trim();
+    return {
+      rowIndex: jobNoIndex[jobNo] || item.rowIndex,
+      rowData: item.rowData,
+      isNew: item.isNew
+    };
+  });
+}
+
+function buildSheetRowValues(existingRow, updateData, maxCol) {
+  const row = [];
+
+  for (let i = 0; i < maxCol; i++) {
+    row[i] = existingRow[i] !== undefined ? existingRow[i] : '';
+  }
+
+  Object.keys(updateData).forEach((colIndex) => {
+    row[parseInt(colIndex, 10) - 1] = updateData[colIndex];
+  });
+
+  return row;
+}
+
+function writeBatchUpdates(sheet, updates, maxCol) {
+  if (!updates.length) return;
+
+  updates.sort((a, b) => a.rowIndex - b.rowIndex);
+
+  let groupStart = updates[0].rowIndex;
+  let groupValues = [updates[0].values];
+  let previousRow = updates[0].rowIndex;
+
+  for (let i = 1; i < updates.length; i++) {
+    const item = updates[i];
+
+    if (item.rowIndex === previousRow + 1) {
+      groupValues.push(item.values);
+    } else {
+      sheet.getRange(groupStart, 1, groupValues.length, maxCol).setValues(groupValues);
+      groupStart = item.rowIndex;
+      groupValues = [item.values];
+    }
+
+    previousRow = item.rowIndex;
+  }
+
+  sheet.getRange(groupStart, 1, groupValues.length, maxCol).setValues(groupValues);
+}
+
+function appendBatchRows(sheet, lastRow, appendRows, maxCol) {
+  if (!appendRows.length) return;
+
+  sheet.getRange(lastRow + 1, 1, appendRows.length, maxCol).setValues(appendRows);
+}
+
+/**
+ * ทำเครื่องหมายแถวเก่าที่ยังไม่ได้ลง mailSent ให้ถือว่าส่งแล้ววันนี้
+ * ใช้ครั้งเดียวตอนเริ่มเปิด trigger เพื่อกันส่งเมลย้อนหลังจากข้อมูลเก่า
+ * @return {Object} ผลลัพธ์การ backfill
+ */
+function markUnsentEmailRowsAsSentToday() {
+  try {
+    const ss = SpreadsheetApp.openById(TARGET_SHEET_ID);
+    const sheets = ss.getSheets().filter((sheet) => isYearSheetName(sheet.getName()));
+    const markedAt = formatThaiDate(new Date());
+    let totalMarked = 0;
+    let totalSkipped = 0;
+
+    sheets.forEach((sheet) => {
+      const result = markUnsentEmailRowsAsSentTodayInSheet(sheet, markedAt);
+      totalMarked += result.marked;
+      totalSkipped += result.skipped;
+    });
+
+    const summary = {
+      marked: totalMarked,
+      skipped: totalSkipped,
+      markedAt: markedAt
+    };
+
+    log('Mark unsent email rows as sent today result: ' + JSON.stringify(summary), LOG_LEVEL.INFO);
+    return summary;
+  } catch (e) {
+    log('Error marking unsent email rows as sent today: ' + e.message, LOG_LEVEL.ERROR);
+    throw e;
+  }
+}
+
+/**
+ * ทำเครื่องหมายแถวในชีทเดียวที่ยังไม่ได้ส่งเมลให้เป็น sent
+ * @param {Sheet} sheet - Sheet ปี
+ * @param {string} markedAt - วันที่เวลาที่ backfill
+ * @return {Object} ผลลัพธ์ของชีทนี้
+ */
+function markUnsentEmailRowsAsSentTodayInSheet(sheet, markedAt) {
+  const headerMap = buildHeaderMap(sheet);
+  const maxCol = getMaxHeaderColumn(headerMap);
+  const lastRow = sheet.getLastRow();
+
+  if (lastRow <= 1 || !headerMap.mailSent || !headerMap.lastEmailKey) {
+    return {
+      marked: 0,
+      skipped: 0
+    };
+  }
+
+  const values = sheet.getRange(1, 1, lastRow, Math.max(sheet.getLastColumn(), maxCol)).getValues();
+  const updates = [];
+  let marked = 0;
+  let skipped = 0;
+
+  for (let r = 1; r < values.length; r++) {
+    const row = values[r];
+    const mailSent = String(row[headerMap.mailSent - 1] || '').trim().toLowerCase();
+    const rowData = buildRowDataFromSheetRow(row, headerMap);
+
+    if (mailSent || !shouldProcessForEmail(rowData.status, '')) {
+      skipped++;
+      continue;
+    }
+
+    const updateData = {};
+    updateData[headerMap.mailSent] = EMAIL_STATUS.SENT;
+    updateData[headerMap.lastEmailKey] = buildEmailNotificationKey(rowData);
+
+    if (headerMap.updatedAt) {
+      updateData[headerMap.updatedAt] = markedAt;
+    }
+
+    updates.push({
+      rowIndex: r + 1,
+      values: buildSheetRowValues(row, updateData, maxCol)
+    });
+    marked++;
+  }
+
+  writeBatchUpdates(sheet, updates, maxCol);
+  log('Marked unsent email rows in sheet ' + sheet.getName() + ': ' + marked, LOG_LEVEL.INFO);
+
+  return {
+    marked: marked,
+    skipped: skipped
+  };
+}
+
+/**
+ * ตรวจว่าชื่อชีทเป็นปี เช่น 2026
+ * @param {string} sheetName - ชื่อชีท
+ * @return {boolean} true ถ้าเป็นชีทปี
+ */
+function isYearSheetName(sheetName) {
+  return /^\d{4}$/.test(String(sheetName || '').trim());
+}
+
+/**
+ * สร้าง rowData จากข้อมูลในชีทเป้าหมาย
+ * @param {Array} row - row values
+ * @param {Object} headerMap - Header map
+ * @return {Object} rowData
+ */
+function buildRowDataFromSheetRow(row, headerMap) {
+  const rowData = {};
+
+  Object.keys(headerMap).forEach((key) => {
+    rowData[key] = row[headerMap[key] - 1];
+  });
+
+  return rowData;
+}
+
+/**
+ * เรียงข้อมูลทั้งชีทตาม contactDate จากน้อยไปมาก
+ * @param {Sheet} sheet - Sheet object
+ * @param {Object} headerMap - Header map
+ */
+function sortSheetByContactDate(sheet, headerMap) {
+  try {
+    if (!headerMap.contactDate) return;
+
+    const lastRow = sheet.getLastRow();
+    const lastCol = sheet.getLastColumn();
+
+    if (lastRow <= 2) {
+      return;
+    }
+
+    const range = sheet.getRange(2, 1, lastRow - 1, lastCol);
+    const values = range.getValues();
+    const contactDateCol = headerMap.contactDate - 1;
+
+    values.sort((a, b) => {
+      return compareDateValues(a[contactDateCol], b[contactDateCol]);
+    });
+
+    range.setValues(values);
+
+    log('Sorted sheet by contactDate ascending', LOG_LEVEL.INFO);
+  } catch (e) {
+    log('Error sorting sheet by contactDate: ' + e.message, LOG_LEVEL.WARNING);
+  }
+}
+
+/**
+ * ตรวจสอบประเภทบริการที่อนุญาตให้นำเข้าชีท
+ * @param {string} serviceTypeName - ชื่อประเภทบริการ
+ * @return {boolean} true ถ้าเป็นประเภทที่อนุญาต
+ */
+function isAllowedServiceType(serviceTypeName) {
+  const serviceType = String(serviceTypeName || '').trim();
+
+  if (!serviceType) {
+    return false;
+  }
+
+  return ALLOWED_SERVICE_TYPES.indexOf(serviceType) !== -1;
+}
+
+/**
+ * ตรวจสอบว่าควรส่ง email หรือไม่
+ * @param {string} status - Status ปัจจุบัน
+ * @param {string} existingStatus - Status เดิม
+ * @return {boolean} true ถ้าต้องส่ง
+ */
+function shouldProcessForEmail(status, existingStatus) {
+  try {
+    const statusTrim = String(status || '').trim().toLowerCase();
+    const existingStatusTrim = String(existingStatus || '').trim().toLowerCase();
+    
+    // ไม่ส่ง ถ้า status เป็น Open หรือ Close
+    if (statusTrim === 'open' || statusTrim === 'close' || statusTrim === 'closed') {
+      return false;
+    }
+    
+    if (!statusTrim) {
+      return false;
+    }
+    
+    // ส่ง ถ้า status เปลี่ยนจากเดิม
+    if (statusTrim !== existingStatusTrim) {
+      return true;
+    }
+    
+    return false;
+  } catch (e) {
+    log('Error checking if should process for email: ' + e.message, LOG_LEVEL.WARNING);
+    return false;
+  }
+}
+
+/**
+ * สร้างคีย์สำหรับกันส่งอีเมลซ้ำในสถานะเดิมของงานเดิม
+ * @param {Object} rowData - ข้อมูลแถว
+ * @return {string} Email notification key
+ */
+function buildEmailNotificationKey(rowData) {
+  const jobNo = String((rowData && rowData.jobNo) || '').trim();
+  const status = String((rowData && rowData.status) || '').trim().toLowerCase();
+  const assignto = String((rowData && rowData.assignto) || '').trim();
+
+  return [jobNo, status, assignto].join('|');
+}
+
+/**
+ * อ่าน lastEmailKey จาก row values
+ * @param {Array} row - ข้อมูลหนึ่งแถวจากชีท
+ * @param {Object} headerMap - Header map
+ * @return {string} lastEmailKey
+ */
+function getLastEmailKeyFromRow(row, headerMap) {
+  if (!headerMap.lastEmailKey) return '';
+  return String((row && row[headerMap.lastEmailKey - 1]) || '').trim();
+}
+
+/**
+ * อ่าน lastEmailKey จากชีท
+ * @param {Sheet} sheet - Sheet object
+ * @param {number} rowIndex - หมายเลขแถว
+ * @param {Object} headerMap - Header map
+ * @return {string} lastEmailKey
+ */
+function getLastEmailKeyFromSheet(sheet, rowIndex, headerMap) {
+  if (!headerMap.lastEmailKey) return '';
+  return String(getCellValue(sheet, rowIndex, headerMap.lastEmailKey) || '').trim();
+}
+
+/**
+ * ตรวจสอบว่า key นี้เคยส่งแล้วหรือยัง
+ * @param {Sheet} sheet - Sheet object
+ * @param {number} rowIndex - หมายเลขแถว
+ * @param {Object} headerMap - Header map
+ * @param {Object} rowData - ข้อมูลแถว
+ * @return {boolean} true ถ้าเคยส่ง key นี้แล้ว
+ */
+function hasEmailKeyBeenSent(sheet, rowIndex, headerMap, rowData) {
+  const currentEmailKey = buildEmailNotificationKey(rowData);
+
+  if (hasEmailLogKeySent('notification', currentEmailKey)) {
+    return true;
+  }
+
+  const lastEmailKey = getLastEmailKeyFromSheet(sheet, rowIndex, headerMap);
+
+  return currentEmailKey && lastEmailKey === currentEmailKey;
+}
+
+/**
+ * ตรวจสอบว่าเคย send email ลงแล้วหรือไม่
+ * @param {Sheet} sheet - Sheet object
+ * @param {number} rowIndex - หมายเลขแถว
+ * @param {Object} headerMap - Header map
+ * @return {boolean} true ถ้าเคย send แล้ว
+ */
+function hasEmailBeenSent(sheet, rowIndex, headerMap) {
+  try {
+    if (!headerMap.mailSent) return false;
+    
+    const mailSentValue = String(getCellValue(sheet, rowIndex, headerMap.mailSent) || '').trim().toLowerCase();
+    return mailSentValue === EMAIL_STATUS.SENT;
+  } catch (e) {
+    log('Error checking if email has been sent: ' + e.message, LOG_LEVEL.WARNING);
+    return false;
+  }
+}
+
+/**
+ * ทำเครื่องหมายว่า email ถูกส่งแล้ว
+ * @param {Sheet} sheet - Sheet object
+ * @param {number} rowIndex - หมายเลขแถว
+ * @param {Object} headerMap - Header map
+ */
+function markEmailAsSent(sheet, rowIndex, headerMap) {
+  try {
+    if (headerMap.mailSent) {
+      setCellValue(sheet, rowIndex, headerMap.mailSent, EMAIL_STATUS.SENT);
+      log('Marked email as sent for row: ' + rowIndex, LOG_LEVEL.DEBUG);
+    }
+  } catch (e) {
+    log('Error marking email as sent: ' + e.message, LOG_LEVEL.WARNING);
+  }
+}
+
+/**
+ * ทำเครื่องหมายว่า email key ปัจจุบันถูกส่งแล้ว
+ * @param {Sheet} sheet - Sheet object
+ * @param {number} rowIndex - หมายเลขแถว
+ * @param {Object} headerMap - Header map
+ * @param {Object} rowData - ข้อมูลแถว
+ */
+function markEmailKeyAsSent(sheet, rowIndex, headerMap, rowData) {
+  try {
+    if (headerMap.lastEmailKey) {
+      setCellValue(sheet, rowIndex, headerMap.lastEmailKey, buildEmailNotificationKey(rowData));
+      log('Marked email key as sent for row: ' + rowIndex, LOG_LEVEL.DEBUG);
+    }
+  } catch (e) {
+    log('Error marking email key as sent: ' + e.message, LOG_LEVEL.WARNING);
+  }
+}
