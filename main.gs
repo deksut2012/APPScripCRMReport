@@ -51,16 +51,15 @@ function main() {
     moveOtherFilesToTrash(allFiles, latestFile);
     
     // ขั้นตอนที่ 3: แปลงไฟล์ Excel เป็น Google Spreadsheet
-    log('Step 3: Reading Excel file directly...', LOG_LEVEL.INFO);
-    let rawData = readDataFromExcelFile(latestFile);
-    
-    // ขั้นตอนที่ 4: อ่านข้อมูลจากไฟล์ที่แปลง
-    log('Step 4: Converting Excel file only if direct read failed...', LOG_LEVEL.INFO);
-    if (!rawData || rawData.length === 0) {
-      const tempSpreadsheet = convertExcelToSpreadsheet(latestFile);
-      tempSpreadsheetId = tempSpreadsheet ? tempSpreadsheet.getId() : '';
-      rawData = tempSpreadsheet ? readDataFromSpreadsheet(tempSpreadsheet) : [];
-    }
+    // ใช้ Drive conversion เป็นเส้นทางหลักเพื่อหลีกเลี่ยงหน่วยความจำสูงจาก
+    // Utilities.unzip + XmlService ซึ่งอาจทำให้ Apps Script INTERNAL error
+    log('Step 3: Converting Excel file to Google Spreadsheet...', LOG_LEVEL.INFO);
+    const tempSpreadsheet = convertExcelToSpreadsheet(latestFile);
+    tempSpreadsheetId = tempSpreadsheet ? tempSpreadsheet.getId() : '';
+
+    // ขั้นตอนที่ 4: อ่านข้อมูลจาก Spreadsheet ที่แปลงแล้ว
+    log('Step 4: Reading converted spreadsheet...', LOG_LEVEL.INFO);
+    const rawData = tempSpreadsheet ? readDataFromSpreadsheet(tempSpreadsheet) : [];
     
     if (!rawData || rawData.length === 0) {
       log('No data found in Excel file. Exiting.', LOG_LEVEL.WARNING);
