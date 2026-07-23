@@ -90,7 +90,7 @@ function processRow(sheet, rowData, headerMap) {
  * @param {Object} headerMap - Header map
  * @return {Object} Object ที่มี colNumber: value
  */
-function buildUpdateData(rowData, headerMap) {
+function buildUpdateData(rowData, headerMap, updatedAtText) {
   try {
     const update = {};
     
@@ -108,7 +108,7 @@ function buildUpdateData(rowData, headerMap) {
     
     // บันทึกเวลา update
     if (headerMap.updatedAt) {
-      update[headerMap.updatedAt] = formatThaiDate(new Date());
+      update[headerMap.updatedAt] = updatedAtText || formatThaiDateFast(new Date());
     }
     
     return update;
@@ -197,14 +197,14 @@ function buildFlowEventKey(rowData) {
  * @param {string} eventType - create/update
  * @param {Object} contactMap - map ชื่อจาก EMAIL
  */
-function queueFlowTrackingEventIfNeeded(flowRowsToAppend, flowHeaderMap, existingFlowEventKeys, rowData, eventType, contactMap) {
+function queueFlowTrackingEventIfNeeded(flowRowsToAppend, flowHeaderMap, existingFlowEventKeys, rowData, eventType, contactMap, timestampText) {
   const eventKey = buildFlowEventKey(rowData);
 
   if (!eventKey || existingFlowEventKeys[eventKey]) {
     return;
   }
 
-  flowRowsToAppend.push(buildFlowTrackingSheetRow(rowData, eventType, contactMap, flowHeaderMap));
+  flowRowsToAppend.push(buildFlowTrackingSheetRow(rowData, eventType, contactMap, flowHeaderMap, timestampText));
   existingFlowEventKeys[eventKey] = true;
 }
 
@@ -234,13 +234,13 @@ function appendFlowTrackingEventIfNeeded(flowSheet, flowHeaderMap, existingFlowE
  * @param {Object} flowHeaderMap - Header map ของ FLOW_TRACKING
  * @return {Array} row values
  */
-function buildFlowTrackingSheetRow(rowData, eventType, contactMap, flowHeaderMap) {
+function buildFlowTrackingSheetRow(rowData, eventType, contactMap, flowHeaderMap, timestampText) {
   const maxCol = getMaxHeaderColumn(flowHeaderMap);
   const row = [];
   const assignto = String((rowData && rowData.assignto) || '').trim();
   const ownerSubjectId = String((rowData && rowData.ownerSubjectId) || '').trim();
   const sysDevelop = String((rowData && rowData.sysDevelop) || '').trim();
-  const nowText = formatThaiDate(new Date());
+  const nowText = timestampText || formatThaiDateFast(new Date());
   const valuesByKey = {
     timestamp: nowText,
     jobNo: String((rowData && rowData.jobNo) || '').trim(),
@@ -332,12 +332,14 @@ function processAllRows(sheet, dataRows, headerMap) {
     const updates = [];
     const appendRows = [];
     const flowRowsToAppend = [];
+    const batchTimestamp = formatThaiDateFast(new Date());
     let skippedEmptyJobNo = 0;
     let skippedServiceType = 0;
     let skippedNoChange = 0;
     const normalizedRows = [];
     
-    dataRows.forEach((rawRow, index) => {
+    const normalizeStartedAt = Date.now();
+    dataRows.forEach((rawRow) => {
       // จัดรูปแบบข้อมูล
       const rowData = normalizeRow(rawRow);
       
@@ -355,14 +357,17 @@ function processAllRows(sheet, dataRows, headerMap) {
         normalizedRows.push(rowData);
       }
     });
+    logStep9Timing('Normalized and filtered ' + dataRows.length + ' source rows', normalizeStartedAt);
 
+    const normalizedSortStartedAt = Date.now();
     normalizedRows.sort(compareRowDataByContactDate);
+    logStep9Timing('Sorted ' + normalizedRows.length + ' normalized rows in memory', normalizedSortStartedAt);
     const rowProcessingStartedAt = Date.now();
 
     normalizedRows.forEach((rowData) => {
         const jobNoKey = String(rowData.jobNo).trim();
         const existingRowIndex = jobNoIndex[jobNoKey];
-        const updateData = buildUpdateData(rowData, headerMap);
+        const updateData = buildUpdateData(rowData, headerMap, batchTimestamp);
 
         if (existingRowIndex) {
           const existingRow = existingValues[existingRowIndex - 1] || [];
@@ -380,7 +385,7 @@ function processAllRows(sheet, dataRows, headerMap) {
           const shouldBackfillOriginalAssignto = headerMap.originalAssignto && !existingOriginalAssignto && !!updateData[headerMap.originalAssignto];
           const shouldAddFlowEvent = hasStatusChanged || hasAssigntoChanged || hasSysDevelopChanged;
           if (shouldAddFlowEvent) {
-            queueFlowTrackingEventIfNeeded(flowRowsToAppend, flowHeaderMap, existingFlowEventKeys, rowData, 'update', contactMap);
+            queueFlowTrackingEventIfNeeded(flowRowsToAppend, flowHeaderMap, existingFlowEventKeys, rowData, 'update', contactMap, batchTimestamp);
           }
 
           if (hasStatusChanged || hasAssigntoChanged || hasSysDevelopChanged || shouldBackfillOriginalAssignto) {
@@ -405,7 +410,7 @@ function processAllRows(sheet, dataRows, headerMap) {
         } else {
           const newRowIndex = lastRow + appendRows.length + 1;
           applyOriginalAssigntoToUpdateData(updateData, headerMap, rowData, '', '');
-          queueFlowTrackingEventIfNeeded(flowRowsToAppend, flowHeaderMap, existingFlowEventKeys, rowData, 'create', contactMap);
+          queueFlowTrackingEventIfNeeded(flowRowsToAppend, flowHeaderMap, existingFlowEventKeys, rowData, 'create', contactMap, batchTimestamp);
           appendRows.push(buildSheetRowValues([], updateData, maxCol));
           jobNoIndex[jobNoKey] = newRowIndex;
 
@@ -482,6 +487,13 @@ function buildJobNoIndex(values, headerMap) {
 }
 
 function compareRowDataByContactDate(a, b) {
+  if (a && b && a._contactDateTime !== undefined && b._contactDateTime !== undefined) {
+    if (a._contactDateTime === null && b._contactDateTime === null) return 0;
+    if (a._contactDateTime === null) return 1;
+    if (b._contactDateTime === null) return -1;
+    return a._contactDateTime - b._contactDateTime;
+  }
+
   return compareDateValues(a.contactDate, b.contactDate);
 }
 

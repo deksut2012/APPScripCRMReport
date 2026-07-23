@@ -282,7 +282,8 @@ function normalizeRow(rawRow) {
                            rawRow['วันที่แจ้ง'] ||
                            rawRow['contact_date'] ||
                            rawRow['วันที่'];
-    const contactDate = formatThaiDate(parseDate(rawContactDate));
+    const parsedContactDate = parseDate(rawContactDate);
+    const contactDate = formatThaiDateFast(parsedContactDate);
     
     // หา assignto (ผู้รับแจ้ง)
     const assignto = String(rawRow['assignto'] || 
@@ -325,7 +326,8 @@ function normalizeRow(rawRow) {
       sysserViceTypeName: sysserViceTypeName,
       status: status,
       productName: productName,
-      sysDevelop: sysDevelop
+      sysDevelop: sysDevelop,
+      _contactDateTime: parsedContactDate ? parsedContactDate.getTime() : null
     };
     
     // ตรวจสอบ QA - ถ้า ownerSubjectId หรือ assignto ตรงกับ QA_ASSIGNEES
@@ -340,6 +342,24 @@ function normalizeRow(rawRow) {
     log('Error normalizing row: ' + JSON.stringify(rawRow) + ' - ' + e.message, LOG_LEVEL.ERROR);
     return null;
   }
+}
+
+function formatThaiDateFast(dateValue) {
+  if (!dateValue) return '';
+
+  const date = dateValue instanceof Date ? dateValue : parseDate(dateValue);
+  if (!date || isNaN(date.getTime())) return '';
+
+  const pad = (value) => String(value).padStart(2, '0');
+  return [
+    pad(date.getDate()),
+    pad(date.getMonth() + 1),
+    date.getFullYear()
+  ].join('/') + ' ' + [
+    pad(date.getHours()),
+    pad(date.getMinutes()),
+    pad(date.getSeconds())
+  ].join(':');
 }
 
 /**
@@ -375,7 +395,14 @@ function expandFdRow(rawRow) {
 }
 
 function getPythonDictValue(text, key) {
-  const pattern = new RegExp("'" + key + "'\\s*:\\s*(?:'((?:\\\\'|[^'])*)'|([^,}\\]]+))");
+  if (!getPythonDictValue.patterns) {
+    getPythonDictValue.patterns = {};
+  }
+
+  const patterns = getPythonDictValue.patterns;
+  const pattern = patterns[key] || (
+    patterns[key] = new RegExp("'" + key + "'\\s*:\\s*(?:'((?:\\\\'|[^'])*)'|([^,}\\]]+))")
+  );
   const match = pattern.exec(text);
 
   if (!match) return '';
