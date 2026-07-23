@@ -232,8 +232,25 @@ function deleteTempSpreadsheet() {
  * @param {string} sourceFileName - ชื่อไฟล์ Excel ต้นทาง
  */
 function cleanupTemporaryFiles(tempSpreadsheetId, sourceFileName) {
-  deleteTempSpreadsheetById(tempSpreadsheetId);
-  deleteTempSpreadsheet();
+  const userProperties = PropertiesService.getUserProperties();
+  const storedTempSpreadsheetId = userProperties.getProperty('TEMP_SPREADSHEET_ID');
+  const tempIds = {};
+
+  [tempSpreadsheetId, storedTempSpreadsheetId].forEach((fileId) => {
+    const normalizedId = String(fileId || '').trim();
+    if (normalizedId) {
+      tempIds[normalizedId] = true;
+    }
+  });
+
+  Object.keys(tempIds).forEach((fileId) => {
+    deleteTempSpreadsheetById(fileId);
+  });
+
+  if (storedTempSpreadsheetId) {
+    userProperties.deleteProperty('TEMP_SPREADSHEET_ID');
+  }
+
   deleteConvertedFilesBySourceName(sourceFileName);
 }
 
@@ -246,9 +263,12 @@ function deleteTempSpreadsheetById(fileId) {
     if (!fileId) return;
 
     const tempFile = DriveApp.getFileById(fileId);
-    if (!tempFile.isTrashed()) {
-      tempFile.setTrashed(true);
+    if (tempFile.isTrashed()) {
+      log('Temporary spreadsheet already in trash: ' + fileId, LOG_LEVEL.DEBUG);
+      return;
     }
+
+    tempFile.setTrashed(true);
     log('Deleted temporary spreadsheet by id: ' + fileId, LOG_LEVEL.INFO);
   } catch (e) {
     log('Error deleting temporary spreadsheet by id: ' + e.message, LOG_LEVEL.WARNING);
