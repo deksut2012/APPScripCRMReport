@@ -49,9 +49,12 @@ const ALLOWED_SERVICE_TYPES = [
 ];
 
 // ========== Email Configuration ==========
+const EMAIL_ENABLED = true;
 const SENDER_NAME = 'CRM Report System';
 const EMAIL_SUBJECT_TEMPLATE = 'แจ้งเตือนสถานะงาน {jobNo} : {status}';
 const EMAIL_TIMEZONE = 'GMT+7'; // ประเทศไทย
+// ข้ามการส่งอีเมลแจ้งเตือนรายงาน (per-job) เมื่อ "เรื่องที่แจ้ง" ขึ้นต้นด้วย prefix เหล่านี้
+const EMAIL_SKIP_SUBJECT_PREFIXES = ['PMX2'];
 
 // ========== Header Mapping ==========
 const REQUIRED_HEADERS = [

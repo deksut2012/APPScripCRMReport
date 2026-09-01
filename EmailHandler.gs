@@ -81,9 +81,20 @@ function sendNotificationEmail(sheet, rowIndex, rowData, headerMap) {
   let subject = '';
 
   try {
+    if (!EMAIL_ENABLED) {
+      log('Email sending is disabled. Skipped jobNo: ' + rowData.jobNo, LOG_LEVEL.WARNING);
+      return false;
+    }
+
     // ตรวจสอบเงื่อนไขการส่ง
     if (!shouldProcessForEmail(rowData.status, '')) {
       log('Status does not require email notification: ' + rowData.status, LOG_LEVEL.DEBUG);
+      return false;
+    }
+
+    // ข้ามการส่ง ถ้าเรื่องที่แจ้งขึ้นต้นด้วย prefix ที่กำหนดไว้ (เช่น PMX2)
+    if (isEmailSkippedBySubject(rowData.subject)) {
+      log('Subject matches skip rule, skip email notification: ' + rowData.jobNo + ' - ' + rowData.subject, LOG_LEVEL.INFO);
       return false;
     }
 
@@ -185,6 +196,42 @@ function sendNotificationEmails(sheet, rowsToNotify, headerMap) {
       failed: rowsToNotify ? rowsToNotify.length : 0
     };
   }
+}
+
+/**
+ * ส่งอีเมลแจ้งเตือนเฉพาะ Job No โดยอ่านข้อมูลล่าสุดจากชีทปี
+ * ใช้สำหรับส่งชดเชยเป็นรายเคสโดยไม่ต้องรัน main() ทั้งชุด
+ * @param {string} jobNo - เลขที่งาน
+ * @return {boolean} true ถ้าส่งสำเร็จ
+ */
+function sendNotificationEmailForJobNo(jobNo) {
+  const normalizedJobNo = String(jobNo || '').trim();
+
+  if (!normalizedJobNo) {
+    throw new Error('Job No is required');
+  }
+
+  const ss = SpreadsheetApp.openById(TARGET_SHEET_ID);
+  const yearSheets = ss.getSheets().filter((sheet) => isYearSheetName(sheet.getName()));
+
+  for (let i = 0; i < yearSheets.length; i++) {
+    const sheet = yearSheets[i];
+    const headerMap = buildHeaderMap(sheet);
+    const rowIndex = findRowByJobNo(sheet, normalizedJobNo, headerMap);
+
+    if (!rowIndex) {
+      continue;
+    }
+
+    const maxCol = Math.max(sheet.getLastColumn(), getMaxHeaderColumn(headerMap));
+    const row = sheet.getRange(rowIndex, 1, 1, maxCol).getValues()[0];
+    const rowData = buildRowDataFromSheetRow(row, headerMap);
+
+    log('Manual notification requested for jobNo: ' + normalizedJobNo, LOG_LEVEL.INFO);
+    return sendNotificationEmail(sheet, rowIndex, rowData, headerMap);
+  }
+
+  throw new Error('Job No not found: ' + normalizedJobNo);
 }
 
 /**
@@ -404,6 +451,11 @@ function sendDailySummaryEmailsToDepartment(department) {
  */
 function sendDailySummaryEmailsForRecipients(recipients, recipientGroup) {
   try {
+    if (!EMAIL_ENABLED) {
+      log('Email sending is disabled. Skipped daily summary group: ' + recipientGroup, LOG_LEVEL.WARNING);
+      return { sent: 0, skipped: (recipients || []).length, failed: 0 };
+    }
+
     const ss = SpreadsheetApp.openById(TARGET_SHEET_ID);
     const year = Utilities.formatDate(new Date(), EMAIL_TIMEZONE, 'yyyy');
     const sheet = getSheetByYear(ss, year);
@@ -490,6 +542,11 @@ function sendDailySummaryEmailsForRecipients(recipients, recipientGroup) {
  */
 function testSendDailySummaryTo6101() {
   try {
+    if (!EMAIL_ENABLED) {
+      log('Email sending is disabled. Skipped test summary.', LOG_LEVEL.WARNING);
+      return false;
+    }
+
     const assignto = '6101';
     const email = getEmailForAssignto(assignto);
 
@@ -595,6 +652,11 @@ function buildTestSummaryRowsFor6101() {
  */
 function testSendEmailTo6101() {
   try {
+    if (!EMAIL_ENABLED) {
+      log('Email sending is disabled. Skipped test notification.', LOG_LEVEL.WARNING);
+      return false;
+    }
+
     const assignto = '6101';
     const email = getEmailForAssignto(assignto);
 

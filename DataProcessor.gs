@@ -44,29 +44,30 @@ function processRow(sheet, rowData, headerMap) {
       const hasStatusChanged = existingStatus !== String(rowData.status).trim();
       const hasAssigntoChanged = existingAssignto !== String(rowData.assignto).trim();
       const hasSysDevelopChanged = existingSysDevelop !== String(rowData.sysDevelop || '').trim();
-      const shouldNotify = shouldProcessForEmail(rowData.status, '') && existingEmailKey !== currentEmailKey;
+      const shouldNotify = shouldProcessForEmail(rowData.status, '') && existingEmailKey !== currentEmailKey && !isEmailSkippedBySubject(rowData.subject);
       const shouldBackfillOriginalAssignto = headerMap.originalAssignto && !existingOriginalAssignto && !!updateData[headerMap.originalAssignto];
       const shouldAddFlowEvent = hasStatusChanged || hasAssigntoChanged || hasSysDevelopChanged;
       if (shouldAddFlowEvent) {
         appendFlowTrackingEventIfNeeded(flowSheet, flowHeaderMap, existingFlowEventKeys, rowData, 'update', contactMap);
       }
-      
+
       if (hasStatusChanged || hasAssigntoChanged || hasSysDevelopChanged || shouldBackfillOriginalAssignto) {
         // มีการเปลี่ยนแปลง - ให้อัปเดต
         setRowValues(sheet, existingRowIndex, updateData);
         log('Updated existing row: ' + rowData.jobNo, LOG_LEVEL.INFO);
-        
+
         // ทำเครื่องหมาย email ต้องส่งอีกครั้ง
         if (hasStatusChanged || hasAssigntoChanged) {
           setCellValue(sheet, existingRowIndex, headerMap.mailSent, '');
         }
-        
+
         // เพิ่มตัวอักษร email handler ให้ส่งอีเมล
         return { rowIndex: existingRowIndex, isNew: false, shouldNotify: shouldNotify };
       } else {
-        // ไม่มีการเปลี่ยนแปลง - ข้ามไป
-        log('No changes for jobNo: ' + rowData.jobNo, LOG_LEVEL.DEBUG);
-        return { rowIndex: existingRowIndex, isNew: false, shouldNotify: false };
+        // แม้ข้อมูลไม่เปลี่ยน ต้องคืน shouldNotify เพื่อ retry เมลที่ยังส่งไม่สำเร็จ
+        // หรือส่งรอบใหม่เมื่อสถานะวนกลับมาคีย์เดิมในอดีต
+        log('No data changes for jobNo: ' + rowData.jobNo + ', shouldNotify: ' + shouldNotify, LOG_LEVEL.DEBUG);
+        return { rowIndex: existingRowIndex, isNew: false, shouldNotify: shouldNotify };
       }
     } else {
       // jobNo ใหม่ - ให้เพิ่มแถวใหม่
@@ -76,7 +77,7 @@ function processRow(sheet, rowData, headerMap) {
       setRowValues(sheet, newRowIndex, updateData);
       log('Added new row: ' + rowData.jobNo, LOG_LEVEL.INFO);
       
-      return { rowIndex: newRowIndex, isNew: true, shouldNotify: shouldProcessForEmail(rowData.status, '') };
+      return { rowIndex: newRowIndex, isNew: true, shouldNotify: shouldProcessForEmail(rowData.status, '') && !isEmailSkippedBySubject(rowData.subject) };
     }
   } catch (e) {
     log('Error processing row: ' + e.message, LOG_LEVEL.ERROR);
@@ -381,7 +382,7 @@ function processAllRows(sheet, dataRows, headerMap) {
           const hasStatusChanged = existingStatus !== String(rowData.status).trim();
           const hasAssigntoChanged = existingAssignto !== String(rowData.assignto).trim();
           const hasSysDevelopChanged = existingSysDevelop !== String(rowData.sysDevelop || '').trim();
-          const shouldNotify = shouldProcessForEmail(rowData.status, '') && existingEmailKey !== currentEmailKey;
+          const shouldNotify = shouldProcessForEmail(rowData.status, '') && existingEmailKey !== currentEmailKey && !isEmailSkippedBySubject(rowData.subject);
           const shouldBackfillOriginalAssignto = headerMap.originalAssignto && !existingOriginalAssignto && !!updateData[headerMap.originalAssignto];
           const shouldAddFlowEvent = hasStatusChanged || hasAssigntoChanged || hasSysDevelopChanged;
           if (shouldAddFlowEvent) {
@@ -397,15 +398,19 @@ function processAllRows(sheet, dataRows, headerMap) {
               values: buildSheetRowValues(existingRow, updateData, maxCol)
             });
 
-            if (shouldNotify) {
-              rowsToNotify.push({
-                rowIndex: existingRowIndex,
-                rowData: rowData,
-                isNew: false
-              });
-            }
           } else {
             skippedNoChange++;
+          }
+
+          // แยกการเข้าคิวเมลออกจากเงื่อนไขการอัปเดตข้อมูล เพื่อให้:
+          // 1) retry งานที่ส่งเมลล้มเหลวในรอบก่อน
+          // 2) ส่งเมื่อสถานะ/ผู้รับวนกลับมาค่าเดิมที่เคยเกิดในอดีต
+          if (shouldNotify) {
+            rowsToNotify.push({
+              rowIndex: existingRowIndex,
+              rowData: rowData,
+              isNew: false
+            });
           }
         } else {
           const newRowIndex = lastRow + appendRows.length + 1;
@@ -414,7 +419,7 @@ function processAllRows(sheet, dataRows, headerMap) {
           appendRows.push(buildSheetRowValues([], updateData, maxCol));
           jobNoIndex[jobNoKey] = newRowIndex;
 
-          if (shouldProcessForEmail(rowData.status, '')) {
+          if (shouldProcessForEmail(rowData.status, '') && !isEmailSkippedBySubject(rowData.subject)) {
             rowsToNotify.push({
               rowIndex: newRowIndex,
               rowData: rowData,
@@ -828,6 +833,27 @@ function shouldProcessForEmail(status, existingStatus) {
 }
 
 /**
+ * ตรวจสอบว่า "เรื่องที่แจ้ง" (subject) ต้องข้ามการส่งอีเมลแจ้งเตือนรายงานหรือไม่
+ * (เช่น subject ที่ขึ้นต้นด้วย PMX2 เป็นงานที่ไม่ต้องแจ้งเตือนทางอีเมล)
+ * @param {string} subject - เรื่องที่แจ้ง
+ * @return {boolean} true ถ้าต้องข้ามการส่งอีเมล
+ */
+function isEmailSkippedBySubject(subject) {
+  // ตัดอักขระที่มองไม่เห็น (zero-width space, BOM ฯลฯ) ที่อาจติดมาจากการ copy ข้อมูล
+  // ก่อน trim ปกติ เพื่อไม่ให้ prefix เทียบไม่ติดทั้งที่ตาเห็นว่าขึ้นต้นตรงกัน
+  const subjectTrim = String(subject || '')
+    .replace(/^[\s​-‍﻿ ]+/, '')
+    .trim()
+    .toUpperCase();
+
+  if (!subjectTrim) {
+    return false;
+  }
+
+  return EMAIL_SKIP_SUBJECT_PREFIXES.some((prefix) => subjectTrim.startsWith(String(prefix).toUpperCase()));
+}
+
+/**
  * สร้างคีย์สำหรับกันส่งอีเมลซ้ำในสถานะเดิมของงานเดิม
  * @param {Object} rowData - ข้อมูลแถว
  * @return {string} Email notification key
@@ -873,14 +899,11 @@ function getLastEmailKeyFromSheet(sheet, rowIndex, headerMap) {
  */
 function hasEmailKeyBeenSent(sheet, rowIndex, headerMap, rowData) {
   const currentEmailKey = buildEmailNotificationKey(rowData);
-
-  if (hasEmailLogKeySent('notification', currentEmailKey)) {
-    return true;
-  }
-
   const lastEmailKey = getLastEmailKeyFromSheet(sheet, rowIndex, headerMap);
 
-  return currentEmailKey && lastEmailKey === currentEmailKey;
+  // ใช้เฉพาะคีย์ล่าสุดของแถวเป็น state ปัจจุบัน
+  // ห้ามใช้ EMAIL_LOG ทั้งประวัติมาบล็อก เพราะงานอาจวนกลับมาสถานะ/ผู้รับเดิม
+  return !!currentEmailKey && lastEmailKey === currentEmailKey;
 }
 
 /**
