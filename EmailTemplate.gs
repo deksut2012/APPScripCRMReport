@@ -572,7 +572,7 @@ function buildDailySummaryEmailBody(recipientId, relatedRows) {
 }
 
 /**
- * ดึงงานที่เกี่ยวข้องกับผู้รับ โดยนับ originalAssignto/ownerSubjectId และถ้าผู้รับเป็น DEV ให้นับ sysDevelop เพิ่ม โดยไม่ซ้ำ jobNo
+ * ดึงงานที่เกี่ยวข้องกับผู้รับ โดยนับ originalAssignto/ownerSubjectId และถ้าผู้รับเป็น DEV ให้นับ sysDevelop และ assignto เพิ่ม โดยไม่ซ้ำ jobNo
  * @param {Sheet} sheet - Sheet object
  * @param {Object} headerMap - Header map
  * @param {string} recipientId - ID ผู้รับรายงาน
@@ -614,7 +614,7 @@ function getRelatedJobRowsForRecipient(sheet, headerMap, recipientId, includeQaR
     const isRelatedToRecipient =
       primaryAssignto === normalizedRecipientId ||
       ownerSubjectId === normalizedRecipientId ||
-      (shouldIncludeDevWork && sysDevelop === normalizedRecipientId);
+      (shouldIncludeDevWork && (sysDevelop === normalizedRecipientId || assignto === normalizedRecipientId));
 
     if (!isRelatedToRecipient) {
       continue;

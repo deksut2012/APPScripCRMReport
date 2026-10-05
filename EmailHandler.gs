@@ -456,6 +456,11 @@ function sendDailySummaryEmailsForRecipients(recipients, recipientGroup) {
       return { sent: 0, skipped: (recipients || []).length, failed: 0 };
     }
 
+    if (isSummaryWeekend(new Date())) {
+      log('Daily summary skipped on weekend for group: ' + recipientGroup, LOG_LEVEL.INFO);
+      return { sent: 0, skipped: (recipients || []).length, failed: 0 };
+    }
+
     const ss = SpreadsheetApp.openById(TARGET_SHEET_ID);
     const year = Utilities.formatDate(new Date(), EMAIL_TIMEZONE, 'yyyy');
     const sheet = getSheetByYear(ss, year);
@@ -476,6 +481,17 @@ function sendDailySummaryEmailsForRecipients(recipients, recipientGroup) {
           skippedCount++;
           log('Daily summary skipped: no tracked rows for assignto ' + recipient.assignto, LOG_LEVEL.INFO);
           return;
+        }
+
+        // DEV: ส่งเฉพาะเมื่อมีงานที่ Assingto ตรงกับผู้รับอีเมล
+        if (isDevAssignee(recipient.assignto)) {
+          const recipientId = normalizeId(recipient.assignto);
+          const hasAssignedRows = trackedRows.some((row) => normalizeId(row.assignto) === recipientId);
+          if (!hasAssignedRows) {
+            skippedCount++;
+            log('Daily summary skipped: no Assingto-matched rows for DEV assignto ' + recipient.assignto, LOG_LEVEL.INFO);
+            return;
+          }
         }
 
         const htmlBody = buildDailySummaryEmailBody(recipient.assignto, trackedRows);
@@ -533,6 +549,40 @@ function sendDailySummaryEmailsForRecipients(recipients, recipientGroup) {
       failed: 0
     };
   }
+}
+
+/**
+ * ตรวจสอบว่าวันที่เป็นวันเสาร์หรืออาทิตย์ (ตามเวลา EMAIL_TIMEZONE)
+ * @param {Date} date - วันที่
+ * @return {boolean} true ถ้าเป็นวันเสาร์/อาทิตย์
+ */
+function isSummaryWeekend(date) {
+  const dayOfWeek = Utilities.formatDate(date, EMAIL_TIMEZONE, 'u'); // 1=Monday ... 7=Sunday
+  return dayOfWeek === '6' || dayOfWeek === '7';
+}
+
+/**
+ * ตรวจสอบว่าทำไมผู้รับได้/ไม่ได้รับ Report Summary โดยไม่ส่งอีเมล
+ * ใช้รันด้วยมือจาก Apps Script UI แล้วดูผลใน Execution log
+ * @param {string} assignto - รหัสผู้รับ เช่น 6305
+ */
+function debugDailySummaryForAssignto(assignto) {
+  const recipientId = normalizeId(assignto || '6305');
+  const ss = SpreadsheetApp.openById(TARGET_SHEET_ID);
+  const year = Utilities.formatDate(new Date(), EMAIL_TIMEZONE, 'yyyy');
+  const sheet = getSheetByYear(ss, year);
+  const headerMap = buildHeaderMap(sheet);
+  const relatedRows = getRelatedJobRowsForRecipient(sheet, headerMap, recipientId);
+  const trackedRows = relatedRows.filter((row) => normalizeSummaryStatus(row.status));
+  const assignedRows = trackedRows.filter((row) => normalizeId(row.assignto) === recipientId);
+
+  Logger.log('assignto: ' + recipientId + ', department: ' + (getEmployeeDepartment(recipientId) || '-'));
+  Logger.log('email: ' + (getEmailForAssignto(recipientId) || 'ไม่พบในชีท EMAIL'));
+  Logger.log('weekend: ' + isSummaryWeekend(new Date()) + ', sheet: ' + sheet.getName());
+  Logger.log('related rows: ' + relatedRows.length + ', tracked rows: ' + trackedRows.length + ', Assingto-matched rows: ' + assignedRows.length);
+  relatedRows.forEach((row) => {
+    Logger.log([row.jobNo, 'status=' + row.status, 'assignto=' + row.assignto, 'originalAssignto=' + row.originalAssignto, 'sysDevelop=' + row.sysDevelop].join(' | '));
+  });
 }
 
 /**
@@ -642,6 +692,121 @@ function buildTestSummaryRowsFor6101() {
       status: 'Open',
       productName: 'CRM Report',
       sysDevelop: '6101'
+    }
+  ];
+}
+
+/**
+ * ทดสอบส่งอีเมลรายงานสรุปหา assignto 6305 หนึ่งฉบับ
+ * ใช้รันด้วยมือจาก Apps Script UI โดยไม่แก้ค่า mailSent ในชีทงาน
+ * @return {boolean} true ถ้าส่งสำเร็จ
+ */
+function testSendDailySummaryTo6305() {
+  try {
+    if (!EMAIL_ENABLED) {
+      log('Email sending is disabled. Skipped test summary.', LOG_LEVEL.WARNING);
+      return false;
+    }
+
+    const assignto = '6305';
+    const email = getEmailForAssignto(assignto);
+
+    if (!email) {
+      log('Test daily summary failed: no email found for assignto ' + assignto, LOG_LEVEL.ERROR);
+      return false;
+    }
+
+    const ss = SpreadsheetApp.openById(TARGET_SHEET_ID);
+    const year = Utilities.formatDate(new Date(), EMAIL_TIMEZONE, 'yyyy');
+    const sheet = getSheetByYear(ss, year);
+    const headerMap = buildHeaderMap(sheet);
+    let relatedRows = getRelatedJobRowsForRecipient(sheet, headerMap, assignto);
+    const trackedRows = relatedRows.filter((row) => normalizeSummaryStatus(row.status));
+
+    if (trackedRows.length === 0) {
+      relatedRows = buildTestSummaryRowsForDEV('6305');
+      log('No tracked rows found for test summary. Using sample rows for layout test.', LOG_LEVEL.INFO);
+    }
+
+    const htmlBody = buildDailySummaryEmailBody(assignto, relatedRows);
+    const reportDate = Utilities.formatDate(new Date(), EMAIL_TIMEZONE, 'dd/MM/yyyy');
+
+    MailApp.sendEmail({
+      to: email,
+      subject: '[TEST] CRM Report Summary ' + reportDate + ' - ' + assignto,
+      htmlBody: htmlBody,
+      name: SENDER_NAME
+    });
+    appendEmailLogEntry({
+      emailType: 'test_summary',
+      rowData: {
+        assignto: assignto,
+        status: 'summary'
+      },
+      email: email,
+      emailKey: buildSummaryEmailKey(assignto, reportDate) + '|test',
+      result: EMAIL_STATUS.SENT,
+      message: 'Test summary sent. Related rows: ' + relatedRows.length,
+      subject: '[TEST] CRM Report Summary ' + reportDate + ' - ' + assignto
+    });
+
+    log('Test daily summary email sent to: ' + email + ' for assignto: ' + assignto + ', related rows: ' + relatedRows.length, LOG_LEVEL.INFO);
+    return true;
+  } catch (e) {
+    log('Error sending test daily summary to 6305: ' + e.message, LOG_LEVEL.ERROR);
+    return false;
+  }
+}
+
+/**
+ * สร้างข้อมูลตัวอย่างสำหรับทดสอบ Report Summary ของ DEV
+ * มีทั้งงานที่ Assingto ตรงกับผู้รับ และงานเกี่ยวข้องอื่น (sysDevelop ตรงกับผู้รับ)
+ * @param {string} devId - รหัส DEV (ไม่ระบุจะใช้คนแรกใน DEV_ASSIGNEES)
+ * @return {Array<Object>} test rows
+ */
+function buildTestSummaryRowsForDEV(devId) {
+  const assignto = String(devId || DEV_ASSIGNEES[0]).trim();
+  const otherAssignto = QA_ASSIGNEES[0];
+  const now = new Date();
+  const twoDaysAgo = new Date(now.getTime() - (2 * 24 * 60 * 60 * 1000));
+  const sevenDaysAgo = new Date(now.getTime() - (7 * 24 * 60 * 60 * 1000));
+
+  return [
+    {
+      jobNo: 'BHD-TEST-SUMMARY-DEV-003',
+      subject: 'ทดสอบงาน DEV ที่ Assingto ตรงกับผู้รับ (Open)',
+      ownerSubjectId: otherAssignto,
+      contactDate: formatThaiDate(now),
+      assignto: assignto,
+      originalAssignto: assignto,
+      sysserViceTypeName: 'Bug',
+      status: 'Open',
+      productName: 'CRM Report',
+      sysDevelop: assignto
+    },
+    {
+      jobNo: 'BHD-TEST-SUMMARY-DEV-002',
+      subject: 'ทดสอบงาน DEV ที่ Assingto ตรงกับผู้รับ (EditErr)',
+      ownerSubjectId: otherAssignto,
+      contactDate: formatThaiDate(twoDaysAgo),
+      assignto: assignto,
+      originalAssignto: assignto,
+      sysserViceTypeName: 'Bug',
+      status: 'EditErr',
+      productName: 'CRM Report',
+      sysDevelop: assignto
+    },
+    {
+      jobNo: 'BFR-TEST-SUMMARY-DEV-001',
+      subject: 'ทดสอบงานเกี่ยวข้องอื่น (DEV ตรงกับผู้รับ แต่ Assingto เป็น QA)',
+      ownerSubjectId: otherAssignto,
+      contactDate: formatThaiDate(sevenDaysAgo),
+      assignto: otherAssignto,
+      originalAssignto: otherAssignto,
+      sysserViceTypeName: 'Feature',
+      status: 'Test',
+      productName: 'CRM Report',
+      sysDevelop: assignto
     }
   ];
 }
